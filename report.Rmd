@@ -33,9 +33,19 @@ dset.males <- read_csv("subsample/results_CABG_20210519_nofemales=1_nomales=0.ou
 dset.females <- read_csv("subsample/results_CABG_20210519_nofemales=0_nomales=1.out")
 ```
 
+
+```{r test, eval = FALSE}
+dset.females %>% pull(outcome) %>% grepl("CABG", .)
+
+dset.females %>%
+    filter(outcome %in% c("I9_STR_SAH")) %>%
+    select(prior, outcome, nobservations, nevents, nindivs_prior_outcome) 
+
+```
+
 # List data
 
-```{r list data}
+```{r list data} 
 dset <- list(interaction = dset.interaction %>%
                  filter(is.na(lag_hr)) %>%
                  select(prior, outcome, sexprior_pval),
