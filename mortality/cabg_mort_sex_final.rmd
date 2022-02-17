@@ -1,0 +1,407 @@
+---
+title: "Mortality after CABG by sex"
+editor_options:
+  chunk_output_type: console
+output:
+  html_document:
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+
+<details><summary>**Libraries**</summary>
+
+```{r}
+setwd("/finngen/red/cabg_prs/cabg_stats_jenni")
+
+#Matching software and its dependencies (Rcpp needed newer version)
+#install.packages("packages/MatchIt_4.3.1.tar.gz", repos = NULL)
+#install.packages("packages/Rcpp_1.0.7.tar.gz", repos = NULL)
+#install.packages("packages/optmatch_0.9-15.tar.gz", repos = NULL)
+#install.packages("packages/RItools_0.1-17.tar.gz", repos=NULL)
+#install.packages("packages/svd_0.5.tar.gz", repos=NULL)
+#install.packages("packages/survey_4.1-1.tar.gz", repos=NULL)
+
+#Extra graphics for inset: cowplot
+#install.packages("packages/cowplot_1.1.1.tar.gz", repos = NULL)
+
+library(survey)     #Veikkaan pakettikikkailua, jotta saadaan ladattua uudempi versio riippuvuudesta
+library(tidyverse)
+library(data.table) # fread() function
+library(gridExtra)  # plots to grid
+
+library(survival)   # survival analysis
+library(survminer)  # ggbased visualization and extra diagnostics
+library(tableone)
+library(MatchIt)  #pairwise matching
+library(kableExtra) # Pretty tables 
+library(cowplot) #extra stuff for figures
+
+source('functions3.R')
+```
+
+</details>
+
+
+# Data
+
+## Read and combine
+
+<br>
+**Select columns outside the R**
+
+Endpoint and covariate files are transfered and unzipped. Columns are selected from endpoint file prior to import to R, because the original phenotype file is very large.
+
+```{bash, eval=F}
+
+#Self written perl-script to extract columns from phenotype file 
+phenoindir="/finngen/red/phenotype-R7"
+phenodir="/finngen/red/cabg_prs/data/cabg_stats/cabg_sex"
+perl /finngen/red/cabg_prs/scripts/select_columns.pl  $phenoindir/finngen_R7_endpoint.txt  $phenodir/finngen_R7_cabgD.txt FINNGENID I9_CABG I9_CABG_AGE DEATH DEATH_AGE I9_K_CARDIAC I9_K_CARDIAC_AGE E4_DIABETES E4_DIABETES_AGE I9_HYPTENS I9_HYPTENS_AGE I9_AF I9_AF_AGE I9_VHD I9_VHD_AGE FU_END_AGE &
+
+```
+
+<br>
+**Loading data and combining data**
+
+```{r}
+
+study_starts <- 1998
+
+endpoints <- fread("/finngen/red/cabg_prs/data/cabg_stats/cabg_sex/finngen_R7_cabgD.txt") %>%
+  select(FINNGENID, contains("CABG"), contains("DEATH"), contains("K_CARDIAC"), FU_END_AGE) %>%
+  rename_at(vars(contains('I9_')), list(~str_remove(., "I9_")))
+  #rename_at(vars(contains('E4_')), list(~str_remove(., "E4_"))) 
+
+covs <- fread("/finngen/library-red/finngen_R7/phenotype_2.0/data/finngen_R7_minimum.txt.gz") %>%
+  mutate(SMOKER = if_else(SMOKE3=="current", 1, 0),
+         BMI = WEIGHT/(HEIGHT/100)^2,
+         BIRTH_TYEAR = BL_YEAR - BL_AGE,
+         START_AGE = study_starts - BIRTH_TYEAR,
+         START_AGE = if_else(START_AGE <0, 0, START_AGE),
+         female = if_else(SEX == "female",1,0) ) %>%
+  select(FINNGENID, BIRTH_TYEAR, SEX, female, BMI, SMOKER, START_AGE, contains("BL"))
+  
+
+df_all <- covs %>%
+  left_join(endpoints, by = c("FINNGENID" = "FINNGENID")) 
+
+dim(df_all)
+
+```
+
+
+<br>
+**Index age is defined; filtering if FU_END_AGE > INDEX_AGE**
+
+For controls 'START_AGE' is set as index age. 'START_AGE' is age at 1998 or at start of follow up.
+We remove persons if followup ends before index age. 
+
+```{r}
+
+df_tmp <-df_all %>% 
+  filter(!is.na(CABG)) %>%
+  mutate(INDEX_AGE = if_else(CABG == 1, CABG_AGE, START_AGE),
+         AGE_DIFF = DEATH_AGE - INDEX_AGE,
+         female = as.numeric(female),
+         CABG = as.factor(CABG)) %>%
+  filter(FU_END_AGE > INDEX_AGE) #%>%
+  #filter(CABG_AGE >= START_AGE)     #We do not remove CABG before 1998 - if we keep
+                                        #there is much more cases with nearly 20 years followup
+dim(df_tmp)
+
+```
+
+
+<br>
+**Missing covariates removed**
+
+We remove persons if either BMI or SMOKING status is missing. 
+
+
+```{r}
+
+df <- df_tmp %>%
+  filter(!is.na(SEX), !is.na(BMI), !is.na(SMOKER), FU_END_AGE >=0)
+dim(df)
+
+```
+
+
+<br>
+<details><summary>**Summaries**</summary>
+
+
+```{r}
+
+factors <- c("SMOKER", "SEX", "CABG", "DEATH")
+
+#All data
+df_all %>% mutate_at(all_of(factors), as.factor) %>% summary()
+
+#Removed if index age before end of followup
+df_tmp %>% mutate_at(all_of(factors), as.factor) %>% summary()
+
+#Final data, persons with missing covariates removed:
+df %>% mutate_at(all_of(factors), as.factor) %>% summary() 
+
+#Filtered by CABG and sex:
+df %>% mutate_at("CABG", as.factor) %>% filter(CABG==1, female==1) %>% summary()
+df %>% mutate_at("CABG", as.factor) %>% filter(CABG==1, female==0) %>% summary()
+
+```
+
+</details>
+<br>
+
+## Matched dataset
+
+
+Let's use propensity score, so we do not loose data. 
+
+<br>
+**Females**
+
+```{r}
+
+
+##Matching, stratified by sex: 
+
+#Females
+match.out.f <- matchit(CABG ~ INDEX_AGE + BMI + SMOKER, data = df%>%filter(SEX == "female"),
+                 method = "nearest", ratio=1)
+match.out.f
+#plot(match.out.f, type = "qq", interactive = FALSE)
+df.f2 <- match.data(match.out.f)%>% 
+  mutate(CABG = as.integer(as.character(CABG)) )
+
+```
+
+<br>
+**Males**
+
+```{r}
+
+#Males
+match.out.m <- matchit(CABG ~ INDEX_AGE + BMI + SMOKER, data = df%>%filter(SEX == "male"),
+                 method = "nearest", ratio=1)
+match.out.m
+#plot(match.out.m, type = "qq", interactive = FALSE)
+df.m2 <- match.data(match.out.m) %>% 
+  mutate(CABG = as.integer(as.character(CABG)) )
+
+
+```
+
+<br>
+<details><summary>**Matching summaries**</summary>
+
+
+```{r}
+#Match summary: females
+summary(match.out.f)
+
+#Match summary: males
+summary(match.out.m)
+
+```
+
+</details>
+<br>
+
+## Characteristics
+
+
+<br>
+**"CABG" and "No CABG" matched**
+
+```{r}
+
+myvars <- c("INDEX_AGE", "BMI", "SMOKER", "DEATH", "K_CARDIAC", "AGE_DIFF")
+fact_vars <- c("SMOKER","DEATH", "K_CARDIAC")  
+chr_rownames <- c("n", "Age, years (SD)","BMI (SD)", "Smoking (%)",  "Deaths (%)", "Cardiac deaths (%)", "Follow up, years (SD)")
+
+#Women
+table1b.f <-
+  CreateTableOne(vars=myvars, data=df.f2 %>% mutate(CABG = if_else(CABG==1, "CABG", "No CABG")), 
+                 factorVars = fact_vars, strata="CABG", test=F) %>%
+  print(dropEqual=T, printToggle=F, contDigits=1) 
+
+#Men
+table1b.m <- 
+  CreateTableOne(vars=myvars, data=df.m2 %>% mutate(CABG = if_else(CABG==1, "CABG", "No CABG")), 
+                 factorVars = fact_vars, strata="CABG", test=F) %>%
+  print(dropEqual=T, printToggle=F, contDigits=1)
+
+#Combine and change row.names
+table1b <- cbind(table1b.f, table1b.m) 
+row.names(table1b) <- chr_rownames 
+
+table1b %>%
+  my.kable() %>%
+  add_header_above(c(" ", "Women" = 2, "Men" = 2), bold=T)
+
+
+```
+
+
+# CABG vs. DEATH by sex
+
+
+## Kaplan-Mayer 
+
+
+<br>
+**Model by survfit**
+
+
+```{r km survfit}
+
+#Let's change the order of variables to get desired order for legends
+df.mtc2 <- bind_rows(df.f2, df.m2) %>%
+  mutate(SEX = factor(SEX,levels=c("male","female"))) %>%
+  mutate(CABG = factor(CABG,levels=c(1,0)))
+
+km2 <- survfit(Surv(AGE_DIFF, DEATH) ~ SEX + CABG, data=df.mtc2)
+
+```
+
+
+<br>
+**KM plot**
+
+
+Both sexes together/matching separately for sexes:
+
+```{r km plot}
+
+palette=c("#0571B0","#92C5DE","#CA0020","#F4A582") 
+
+plot.km2.main <- ggsurvplot(km2, fun = "event", censor = F, xlab = "Time (years)",
+           size = 0.5, palette=palette, ggtheme = theme_bw(), xlim = c(0,15), ylim = c(0,0.41),
+           legend = "right", ylab = "Cumulative death", conf.int = F, break.x.by=5,
+           legend.labs = c("Men after CABG", "Men, controls", "Women after CABG", "Women, controls"),)$plot +
+  theme_classic() +
+  theme(legend.text = element_text(size = 10), legend.justification = "center")
+
+#plot.km2.main
+
+plot.km2.inset <- ggsurvplot(km2, fun = "event", censor = F, xlab = "Time (years)",
+           size = 0.5, palette=palette, ggtheme = theme_bw(), xlim = c(0,3), ylim = c(0,0.065),
+           ylab = "Cumulative death", conf.int = F, break.x.by=1)$plot +
+  theme_classic() +
+  theme(legend.position = "none", axis.title = element_blank()) 
+#plot.km2.inset
+
+
+km.final <- ggdraw() +
+  draw_plot(plot.km2.main) +
+  draw_plot(plot.km2.inset, halign = 0.22, valign = 0.98, width=0.82, scale=0.4)
+
+ggsave(file = "km_cabg_death_sex.png", plot = km.final, height = 4, width = 5.6, dpi = 150)
+ggsave(file = "km_cabg_death_sex.eps", plot = km.final, height = 4, width = 5.6, dpi = 150)
+km.final
+
+```
+
+## Logistic regression within sex
+
+We will look odd ratios at different length of followups. 
+
+```{r}
+
+year_list <- as.list(1:20)
+
+glm.f.list <- lapply(year_list, function(years){ 
+  df.tmp <- df.f2 %>% 
+    mutate(DEATH_Y = if_else(AGE_DIFF < years, DEATH, 0L)) 
+  #df.tmp %>% mutate_at(c(all_of(factors2)),as.factor) %>% summary()
+  glm(DEATH_Y ~ CABG + INDEX_AGE + BMI + SMOKER, data=df.tmp, family=binomial())
+}) %>% setNames(year_list)
+
+glm.m.list <- lapply(year_list, function(years){ 
+  df.tmp <- df.m2 %>% 
+    mutate(DEATH_Y = if_else(AGE_DIFF < years, DEATH, 0L))
+  glm(DEATH_Y ~ CABG + INDEX_AGE + BMI + SMOKER, data=df.tmp, family=binomial())
+}) %>% setNames(year_list)
+
+table.f <- extract_glm(year_list, glm.f.list, "CABG") %>% rename(Years=Variable) %>% mutate(Sex="Women")
+table.m <- extract_glm(year_list, glm.m.list, "CABG") %>% rename(Years=Variable) %>% mutate(Sex="Men")
+table <- bind_rows(table.f, table.m)
+
+```
+
+
+<details><summary>**Regression details**</summary>
+
+Excerpts from full regression output - after one and five years
+
+```{r}
+
+lapply(glm.f.list[c(1,5)],summary)
+lapply(glm.m.list[c(1,5)],summary)
+```
+
+Example summaries - dataset with one year followup
+
+```{r}
+vars_tmp2 <- c("SEX", "SMOKER", "BMI", "START_AGE", "CABG", "DEATH_Y", "INDEX_AGE", "DEATH_AGE", "START_AGE", "CABG_AGE")
+factors2 <- c("CABG", "DEATH_Y", "SMOKER")
+df.f2 %>% mutate(DEATH_Y = if_else(AGE_DIFF < 1, DEATH, 0L)) %>%  mutate_at(all_of(factors2), as.factor) %>% select(all_of(vars_tmp2)) %>% summary()
+df.m2 %>% mutate(DEATH_Y = if_else(AGE_DIFF < 1, DEATH, 0L)) %>%  mutate_at(all_of(factors2), as.factor) %>% select(all_of(vars_tmp2)) %>% summary()
+
+```
+
+</details>
+
+
+<br>
+<details><summary>**Odds ratio tables**</summary>
+
+```{r}
+
+table.f %>%
+  prettyfy_reg_table() %>%
+  my.kable()
+
+table.m %>%
+  prettyfy_reg_table() %>%
+  my.kable()
+
+ 
+```
+
+</details>
+
+
+<br>
+**Odds ratio plots**
+
+OR's plotted for different length of followups
+
+```{r}
+
+plot_ORs <- table %>%
+  mutate(Years = if_else(Sex == "Women", Years-0.12, Years+0.12)) %>%
+  mutate(Sex = factor(Sex,levels=c("Women","Men"))) %>%
+  ggplot(aes(x=Years, y=odds, color=Sex, shape=Sex)) +
+    geom_hline(yintercept=1, color= "grey50") +
+    geom_pointrange(aes(ymin=low, ymax=high), size=0.35) + 
+    scale_x_continuous(breaks = seq(1,20,1), limits=c(0.8,15.2)) + 
+    scale_y_continuous(trans='log2', breaks=c(0.5,1,2,4,8), limits=c(0.5,8.2)) +
+    #theme_linedraw() +
+    theme_classic() +
+    theme(legend.text = element_text(size = 10)) +
+    labs(title="", x ="Length of follow-up (Years)", y = "OR") +
+    scale_colour_manual(values = c("#CA0020","#0571B0")) +
+    theme(legend.position = c(0.85,0.8)) 
+
+ggsave(file = "ORs_cabg_death_sex.png", plot = plot_ORs, height = 4, width = 5, dpi = 150)
+ggsave(file = "ORs_cabg_death_sex.eps", plot = plot_ORs, height = 4, width = 5, dpi = 150)
+plot_ORs
+
+```
+
