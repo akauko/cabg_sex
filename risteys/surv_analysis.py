@@ -62,12 +62,12 @@ References
     https://plana-ripoll.github.io/NB-COMO/
 """
 import logging
+import hashlib
 from csv import writer as csv_writer
 from os import getenv
 from pathlib import Path
 from queue import LifoQueue
 from time import time as now
-
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
@@ -92,6 +92,7 @@ logger.addHandler(handler)
 logger.setLevel(level)
 # END #
 
+MY_SEED = 2022
 
 STUDY_STARTS = 1998.0  # inclusive
 STUDY_ENDS = 2020.99   # inclusive, using same number format as FinnGen data files
@@ -119,9 +120,9 @@ LOWER_STEP_SIZE   = 0.1
 # need to order them low-to-high in order for the jobs to run the
 # longer durations first.
 LAGS = [
-#    [0, 1],
-#    [1, 5],
-#    [5, 15],
+    [0, 1],
+    [1, 5],
+    [5, 15],
     None
 ]
 
@@ -136,6 +137,7 @@ BCH_TIMEPOINTS = [0, 2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20, 21.99]
 
 EXCLUDE_FEMALES = getenv("EXCLUDE_FEMALES") == "1"
 EXCLUDE_MALES = getenv("EXCLUDE_MALES") == "1"
+
 
 def main(path_pairs, path_definitions, path_dense_fevents, path_info, output_path, timings_path):
     # Initialize the CSV output
@@ -378,6 +380,12 @@ def init_csv(res_file):
     return res_writer
 
 
+def numeric_hash(items):
+    if type(items) is not list: items = [ items ]
+    itemstring = "".join([str(item) for item in items])
+    hash = hashlib.sha1(itemstring.encode("utf-8")).hexdigest()
+    return(int(hash, 16) % (10 ** 8))
+
 def prep_coxhr(pair, lag, df_events, df_info):
     """Prepare the data to be used in the Cox model.
 
@@ -407,13 +415,22 @@ def prep_coxhr(pair, lag, df_events, df_info):
     cohort = set(df_events.FINNGENID)
     cases = set(df_events.loc[df_events.ENDPOINT == outcome, "FINNGENID"])
     size = min(N_SUBCOHORT, len(cohort))
+
+    my_random_hash = numeric_hash([MY_SEED, prior, outcome])
+
+    logger.info(f"Using hash {my_random_hash} for {prior} to {outcome}")
+    
+    np.random.seed(my_random_hash)
     cc_subcohort = set(np.random.choice(list(cohort), size, replace=False))
+
     cc_m = len(cohort - cases)
     cc_ms = len(cc_subcohort & (cohort - cases))
     cc_pm = cc_ms / cc_m
     cc_weight_non_cases = 1 / cc_pm
     cc_sample = cases | cc_subcohort
 
+    logger.info(f"cohort size {len(cohort)}, cases {len(cases)}, subcohort size {size}, non_case weight {cc_weight_non_cases}")
+    
     # Reduce the original population to be the smaller "sample" pop from the case-cohort study
     df_events = df_events.loc[df_events.FINNGENID.isin(cc_sample), :]
     df_info = df_info.loc[df_info.FINNGENID.isin(cc_sample), :]
@@ -803,3 +820,4 @@ if __name__ == '__main__':
         OUTPUT,
         TIMINGS
     )
+
